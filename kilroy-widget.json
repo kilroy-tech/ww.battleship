@@ -1,0 +1,6 @@
+{
+  "name": "Kilroy Battleship",
+  "description": "A Battleship game for group members.",
+  "swarm": "public",
+  "audience": "group"
+}
