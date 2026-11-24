@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Kilroy Battleship</title>
-  <script type="module" src="/apps/kilroy.utils/lib/kilroy/js/webwidget_sdk.js"></script>
   <style>
     :root {
       --bg-deep: #071a2b;
@@ -637,7 +636,7 @@
     import { initWebWidget } from "/apps/kilroy.utils/lib/kilroy/js/webwidget_sdk.js";
 
     const COMMAND_PREFIX = "/ww.bship";
-    const FILTER_PATTERN = "/ww.bship";
+    const FILTER_PATTERN = "^/ww\\.bship\\.";
     const BOARD_SIZE = 10;
     const CHALLENGE_TIMEOUT_MS = 10000;
     const SHOT_TIMEOUT_MS = 30000;
@@ -655,9 +654,9 @@
     const state = {
       joined: false,
       connected: false,
-      alias: "kilroy.groups.bship",
-      selfGuid: kilroyGuid(),
-      targetOrigin: window.location.origin,
+      closed: false,
+      alias: "",
+      selfGuid: "",
       selfName: "",
       phase: "lobby",
       status: "idle",
@@ -665,9 +664,8 @@
       peers: new Map(),
       sdk: null,
       lifecycleState: "WIDGET_OPEN",
-      lastActivationTs: 0,
       pollId: null,
-      activationCleanup: null,
+      resizeCleanup: null,
       resizeObserver: null,
       challenge: null,
       challengeTimerId: null,
@@ -780,45 +778,58 @@
       refs.gameoverOk.addEventListener("click", acknowledgeGameOver);
       refs.targetBoard.addEventListener("click", onTargetBoardClicked);
 
-      window.addEventListener("beforeunload", () => {
-        if (state.pollId) clearInterval(state.pollId);
-        if (state.challengeTimerId) clearTimeout(state.challengeTimerId);
-        if (state.challengeCountdownId) clearInterval(state.challengeCountdownId);
-        if (state.turnTimerId) clearInterval(state.turnTimerId);
-        if (typeof state.activationCleanup === "function") {
-          state.activationCleanup();
-          state.activationCleanup = null;
-        }
+      window.addEventListener("pagehide", (event) => {
+        if (!event.persisted) closeWidget();
       });
+    }
+
+    function closeWidget() {
+      if (state.closed) return;
+      state.closed = true;
+      state.connected = false;
+      state.joined = false;
+      if (state.pollId) clearInterval(state.pollId);
+      if (state.challengeTimerId) clearTimeout(state.challengeTimerId);
+      if (state.challengeCountdownId) clearInterval(state.challengeCountdownId);
+      if (state.turnTimerId) clearInterval(state.turnTimerId);
+      if (typeof state.resizeCleanup === "function") {
+        state.resizeCleanup();
+        state.resizeCleanup = null;
+      }
+      if (state.sdk) state.sdk.disconnect();
+      setBanner("Widget closed.");
+      renderHud();
     }
 
     function initSdk() {
       const boot = readStartupArgs();
-      state.alias = boot.alias || state.alias;
-      state.selfGuid = boot.guid || state.selfGuid;
-      state.targetOrigin = boot.targetOrigin || state.targetOrigin;
+      if (!boot.alias || !boot.guid || !boot.groupName) {
+        refs.joinBtn.disabled = true;
+        setBanner("Configuration error: this widget must be launched by Kilroy (missing alias, guid, or group_name).");
+        return;
+      }
+      state.alias = boot.alias;
+      state.selfGuid = boot.guid;
 
       state.sdk = initWebWidget({
         alias: state.alias,
         guid: state.selfGuid,
         focusBridgeEnabled: true,
-        targetOrigin: state.targetOrigin
+        targetOrigin: window.location.origin
       });
-      window.webwidgetSDK = state.sdk;
       state.sdk.onMessage(onSdkMessage);
       state.sdk.onConnectionState(onSdkConnectionState);
       state.sdk.onLifecycle(onSdkLifecycle);
 
-      state.activationCleanup = installActivationHandlers();
       installResizeHandling();
       updateResponsiveLayout();
 
       state.sdk.ready
         .then(() => state.sdk.setMessageFilters([FILTER_PATTERN]))
         .then(() => {
-          state.connected = true;
+          if (state.closed) return;
+          state.connected = !!state.sdk.connected;
           state.lifecycleState = "WIDGET_CONNECTED";
-          notifyWidgetActivated("sdk_ready");
           setBanner("Connected. Join the lobby to announce your shipyard.");
           renderHud();
         })
@@ -831,6 +842,7 @@
     }
 
     function onSdkConnectionState(event) {
+      if (state.closed) return;
       state.connected = !!event.connected;
       renderHud();
     }
@@ -839,13 +851,18 @@
       const name = event && event.event ? String(event.event) : "";
       if (!name) return;
       state.lifecycleState = name;
-      if (name === "WIDGET_CONNECTED") {
-        notifyWidgetActivated("lifecycle_connected");
+      if (name === "WIDGET_CLOSING") {
+        closeWidget();
+        return;
       }
       renderHud();
     }
 
     function onJoinClicked() {
+      if (!state.sdk || state.closed || !state.connected) {
+        setBanner("Not connected. Wait for the connection before joining.");
+        return;
+      }
       const raw = refs.nameInput.value.trim();
       if (!raw) {
         refs.nameInput.focus();
@@ -910,17 +927,13 @@
 
     function onSdkMessage(event) {
       const raw = (event && event.message) ? String(event.message) : "";
-      if (!raw.startsWith(COMMAND_PREFIX)) return;
+      if (state.closed || !raw.startsWith(COMMAND_PREFIX)) return;
 
       const parsed = parseCommand(raw);
       if (!parsed) return;
 
       const { verb, payload } = parsed;
       if (!payload || typeof payload !== "object") return;
-
-      if (payload.fromGuid && payload.fromGuid === state.selfGuid) {
-        return;
-      }
 
       switch (verb) {
         case "who":
@@ -1490,7 +1503,7 @@
     }
 
     function onLobbyReturn(payload) {
-      if (!payload || payload.fromGuid === state.selfGuid) return;
+      if (!payload) return;
       const peer = state.peers.get(payload.fromGuid);
       if (peer) {
         peer.status = "idle";
@@ -2322,78 +2335,13 @@
       }
     }
 
-    function kilroyGuid() {
-      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-        const r = (Math.random() * 16) | 0;
-        const v = c === "x" ? r : ((r & 0x3) | 0x8);
-        return v.toString(16);
-      });
-    }
-
     function readStartupArgs() {
       const params = new URLSearchParams(window.location.search);
-      const alias = (
-        params.get("alias") ||
-        params.get("webwidget_alias") ||
-        params.get("pdalias") ||
-        ""
-      ).trim();
-      const guid = (
-        params.get("guid") ||
-        params.get("webwidget_guid") ||
-        ""
-      ).trim();
-      const targetOrigin = (
-        params.get("targetOrigin") ||
-        params.get("target_origin") ||
-        window.location.origin ||
-        "*"
-      ).trim();
-      return { alias, guid, targetOrigin };
-    }
-
-    function installActivationHandlers() {
-      const onPointerDown = () => notifyWidgetActivated("pointerdown");
-      const onFocusIn = () => notifyWidgetActivated("focusin");
-      const onWindowFocus = () => notifyWidgetActivated("window_focus");
-      const onVisibility = () => {
-        if (document.visibilityState === "visible") {
-          notifyWidgetActivated("visible");
-        }
+      return {
+        alias: (params.get("alias") || "").trim(),
+        guid: (params.get("guid") || "").trim(),
+        groupName: (params.get("group_name") || "").trim()
       };
-
-      document.addEventListener("pointerdown", onPointerDown, true);
-      document.addEventListener("focusin", onFocusIn, true);
-      window.addEventListener("focus", onWindowFocus, true);
-      document.addEventListener("visibilitychange", onVisibility, true);
-
-      return () => {
-        document.removeEventListener("pointerdown", onPointerDown, true);
-        document.removeEventListener("focusin", onFocusIn, true);
-        window.removeEventListener("focus", onWindowFocus, true);
-        document.removeEventListener("visibilitychange", onVisibility, true);
-      };
-    }
-
-    function notifyWidgetActivated(reason) {
-      if (window.parent === window) return;
-      if (!state.alias) return;
-      const now = Date.now();
-      if (now - state.lastActivationTs < 120) return;
-      state.lastActivationTs = now;
-      try {
-        window.parent.postMessage(
-          {
-            _cmd: "focus_widget_window",
-            pdalias: state.alias,
-            reason,
-            ts: now
-          },
-          state.targetOrigin || "*"
-        );
-      } catch (_err) {
-        // ignore activation bridge errors
-      }
     }
 
     function installResizeHandling() {
@@ -2409,15 +2357,11 @@
         if (appRoot) state.resizeObserver.observe(appRoot);
       }
 
-      const priorCleanup = state.activationCleanup;
-      state.activationCleanup = () => {
+      state.resizeCleanup = () => {
         window.removeEventListener("resize", onResize, true);
         if (state.resizeObserver) {
           state.resizeObserver.disconnect();
           state.resizeObserver = null;
-        }
-        if (typeof priorCleanup === "function") {
-          priorCleanup();
         }
       };
     }
